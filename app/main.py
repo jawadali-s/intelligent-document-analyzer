@@ -1,3 +1,4 @@
+import logging
 import warnings
 from io import BytesIO
 from typing import Annotated
@@ -6,10 +7,21 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from PIL import Image, UnidentifiedImageError
 
+from app.ocr import OCRError
+from app.pipeline import ImageDecodeError, process_invoice_image
+from app.schemas import UploadResponse
+
+logger = logging.getLogger(__name__)
+
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 READ_CHUNK_SIZE_BYTES = 1024 * 1024  # 1 MB
 MAX_IMAGE_PIXELS = 40_000_000  # Images larger than this are rejected
 ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "TIFF"}
+
+DECODE_FAILURE_MESSAGE = (
+    "The image passed validation but could not be decoded for processing."
+)
+OCR_FAILURE_MESSAGE = "Text recognition failed on the server. Please try again later."
 
 # Pillow warns above this limit and raises DecompressionBombError at twice
 # this limit. Both cases are handled inside validate_image().
@@ -18,11 +30,12 @@ Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 app = FastAPI(
     title="Intelligent Image Document Analyzer",
     description=(
-        "A backend API for analyzing image-based documents. "
-        "Currently supports validated image upload; analysis features "
-        "will be added in later steps."
+        "A backend API for analyzing invoice images. An uploaded image is "
+        "validated, preprocessed with OpenCV, read with Tesseract OCR, cleaned, "
+        "and searched with rule-based extraction for the invoice number, date, "
+        "vendor name, subtotal, tax amount and total amount."
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 
@@ -139,11 +152,27 @@ def health_check() -> dict[str, str]:
     return {"status": "healthy"}
 
 
-@app.post("/upload")
+@app.post(
+    "/upload",
+    responses={
+        400: {"description": "Empty file, not an image, or corrupt image."},
+        413: {"description": "File over 10 MB, or image dimensions too large."},
+        415: {"description": "Image format is not JPEG, PNG, WebP or TIFF."},
+        422: {"description": "Image passed validation but could not be decoded."},
+        500: {"description": "Text recognition (OCR) failed on the server."},
+    },
+)
 async def upload_invoice_image(
     file: Annotated[UploadFile, File(description="Invoice image (JPEG, PNG, WebP, TIFF)")],
-) -> dict[str, str | int]:
-    """Validate an uploaded invoice image and return its basic properties."""
+) -> UploadResponse:
+    """Validate an invoice image, run OCR on it, and extract invoice fields.
+
+    The upload is read in chunks (maximum 10 MB) and validated from its actual
+    contents. The image is then preprocessed, read with Tesseract OCR, cleaned,
+    and searched for the invoice number, date, vendor name, subtotal, tax amount
+    and total amount. Fields that cannot be identified reliably are ``null``.
+    Nothing is saved to disk.
+    """
     image_buffer = BytesIO()
     try:
         size_bytes = await read_upload_with_limit(file, image_buffer)
@@ -154,16 +183,30 @@ async def upload_invoice_image(
         image_format, width, height = await run_in_threadpool(
             validate_image, image_buffer
         )
+
+        # The pipeline takes the file's raw bytes, not the BytesIO or a Pillow image.
+        image_bytes = image_buffer.getvalue()
+        try:
+            result = await run_in_threadpool(process_invoice_image, image_bytes)
+        except ImageDecodeError as exc:
+            raise HTTPException(status_code=422, detail=DECODE_FAILURE_MESSAGE) from exc
+        except OCRError as exc:
+            # Log the details for the operator, but keep them out of the response.
+            logger.error("OCR failed while processing an upload: %s", exc, exc_info=exc)
+            raise HTTPException(status_code=500, detail=OCR_FAILURE_MESSAGE) from exc
     finally:
         image_buffer.close()  # Release the in-memory image data.
         await file.close()
 
-    return {
-        "filename": file.filename or "unknown",
-        "format": image_format,
-        "width": width,
-        "height": height,
-        "size_bytes": size_bytes,
-        "status": "valid",
-        "message": "Image was successfully validated.",
-    }
+    return UploadResponse(
+        filename=file.filename or "unknown",
+        format=image_format,
+        width=width,
+        height=height,
+        size_bytes=size_bytes,
+        status="processed",
+        message="Image was validated and processed successfully.",
+        raw_ocr_text=result["raw_ocr_text"],
+        cleaned_text=result["cleaned_text"],
+        invoice_fields=result["invoice_fields"],
+    )
