@@ -6,7 +6,8 @@ order. A field that cannot be identified reliably is ``None``.
 
 * ``invoice_number`` - string, exactly as written (leading zeros kept).
 * ``invoice_date``   - string, exactly as written; only plausibility-checked.
-* ``vendor_name``    - string, the first line after any generic title.
+* ``vendor_name``    - string, from an explicit ``FROM:`` line, otherwise the
+  first line after any generic title or decorative line.
 * ``subtotal``, ``tax_amount``, ``total_amount`` - decimal strings such as
   ``"2500.00"``: no currency symbol, no thousands separators, decimal places
   kept as written. Convert with ``decimal.Decimal`` (never ``float``).
@@ -42,6 +43,11 @@ FIELD_NAMES = (
 
 _MAX_INVOICE_NUMBER_LENGTH = 40
 _MAX_VENDOR_NAME_LENGTH = 80
+
+# "FROM: Studio Name". The colon is required, so "From Scratch Bakery" is not a label.
+_FROM_LABEL_RE = re.compile(r"From\s*[:\N{FULLWIDTH COLON}]\s*(?P<value>.*)", re.IGNORECASE)
+# Words showing that a second party (the customer) is named on the same line.
+_OTHER_PARTY_RE = re.compile(r"\b(?:bill(?:ed)?|ship|sold)\s*to\b", re.IGNORECASE)
 
 
 class InvalidExtractionInputError(TypeError):
@@ -291,14 +297,50 @@ def _is_plausible_vendor(line: str) -> bool:
     return not _looks_like_field_line(line)
 
 
+def _is_decorative_line(line: str) -> bool:
+    """Return True if a line has no letters or digits, such as '-----' or '——'."""
+    return not any(character.isalnum() for character in line)
+
+
+def _find_vendor_from_label(lines: list[str]) -> str | None:
+    """Return the vendor named on an explicit ``FROM:`` line, or ``None``.
+
+    The label needs a colon, so a vendor called "From Scratch Bakery" is not
+    mistaken for a label. The name must pass the usual vendor checks and must
+    not mention another party ("Bill To", "Ship To", "Sold To"). If the value is
+    not valid, that line is ignored and the next ``FROM:`` line is tried.
+    """
+    for line in lines:
+        match = _FROM_LABEL_RE.fullmatch(line)
+        if match is None:
+            continue
+        candidate = match.group("value").strip()
+        if (
+            candidate
+            and _is_plausible_vendor(candidate)
+            and _OTHER_PARTY_RE.search(candidate) is None
+        ):
+            return candidate
+    return None
+
+
 def _find_vendor_name(lines: list[str]) -> str | None:
     """Return the vendor name, or ``None`` if it is not clearly identifiable.
 
-    Only the first non-empty line after any generic title is considered, and
-    it is reported only if labelled invoice fields follow it.
+    An explicit ``FROM:`` line wins. Otherwise only the first non-empty line
+    after any generic title or decorative line is considered, and it is
+    reported only if labelled invoice fields follow it.
     """
+    from_label_vendor = _find_vendor_from_label(lines)
+    if from_label_vendor is not None:
+        return from_label_vendor
+
     for index, line in enumerate(lines):
-        if not line or " ".join(line.lower().split()) in _GENERIC_HEADINGS:
+        if (
+            not line
+            or _is_decorative_line(line)
+            or " ".join(line.lower().split()) in _GENERIC_HEADINGS
+        ):
             continue
         if not _is_plausible_vendor(line):
             return None

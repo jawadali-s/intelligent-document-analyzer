@@ -431,6 +431,182 @@ def test_vendor_name_is_none_when_not_clearly_identifiable(text: str) -> None:
     assert field(text, "vendor_name") is None
 
 
+# --- Vendor name: decorative leading lines -----------------------------------
+
+DECORATIVE_LINES = ["——", "-----", "=====", "*****", "• • •", "~~~ ~~~", "—— ——", "___"]
+
+
+@pytest.mark.parametrize("decoration", DECORATIVE_LINES)
+def test_decorative_leading_line_is_skipped_before_the_vendor(decoration: str) -> None:
+    text = f"{decoration}\nStudio Name\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") == "Studio Name"
+
+
+def test_several_decorative_and_blank_leading_lines_are_skipped() -> None:
+    text = "\n——\n\n=====\nStudio Name\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") == "Studio Name"
+
+
+def test_decorative_line_after_a_generic_title_is_skipped() -> None:
+    text = "INVOICE\n=====\nAcme Corp\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") == "Acme Corp"
+
+
+def test_only_decorative_lines_before_the_fields_give_no_vendor() -> None:
+    assert field("——\nInvoice No: INV-1", "vendor_name") is None
+    assert field("——\n=====", "vendor_name") is None
+
+
+@pytest.mark.parametrize(
+    "first_line",
+    ["12345", "2026-10-17", "-- 1 --", "7-Eleven", "0300 1234567"],
+)
+def test_numeric_leading_line_is_not_skipped_when_looking_for_the_vendor(
+    first_line: str,
+) -> None:
+    text = f"{first_line}\nStudio Name\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") is None
+
+
+def test_leading_line_with_letters_is_not_skipped_as_decoration() -> None:
+    text = "OO —__ ar\nStudio Name\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") == "OO —__ ar"
+
+
+def test_decorative_line_does_not_confirm_a_vendor_without_invoice_fields() -> None:
+    assert field("——\nStudio Name\nThank you for your business", "vendor_name") is None
+
+
+def test_garbled_ocr_text_with_a_decorative_first_line_still_returns_all_none() -> None:
+    text = (
+        "——\n"
+        "FROM SALTO\n"
+        "Studio Name Client Name\n"
+        "Description Qty Rate Amount\n"
+        "Photography Session 1 $450 $450\n"
+        "Photo Editing 25 $20 $500\n"
+        "Prints Package 1 $150 $150\n"
+        "prorat 58100)\n"
+        "OO —__ ar"
+    )
+
+    assert extract_invoice_fields(text) == all_none()
+
+
+# --- Vendor name: explicit FROM label ----------------------------------------
+
+
+def test_from_label_gives_the_vendor_name() -> None:
+    assert field("FROM: Studio Name\nInvoice No: INV-1", "vendor_name") == "Studio Name"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "FROM: Studio Name",
+        "From: Studio Name",
+        "from: Studio Name",
+        "FROM : Studio Name",
+        "FROM:Studio Name",
+        "FROM:   Studio Name",
+        "FROM： Studio Name",  # Full-width colon, as accepted for other labels
+    ],
+)
+def test_from_label_is_case_and_spacing_tolerant(line: str) -> None:
+    assert field(f"{line}\nInvoice No: INV-1", "vendor_name") == "Studio Name"
+
+
+@pytest.mark.parametrize(
+    "vendor",
+    ["Ahmed & Sons (Pvt.) Ltd.", "O'Brien-Smith, Inc.", "Café Müller GmbH", "شركة النور للتجارة"],
+)
+def test_from_label_vendor_is_preserved_exactly(vendor: str) -> None:
+    assert field(f"FROM: {vendor}\nInvoice No: INV-1", "vendor_name") == vendor
+
+
+def test_from_label_works_without_other_invoice_fields() -> None:
+    assert field("FROM: Studio Name", "vendor_name") == "Studio Name"
+
+
+def test_from_label_after_a_title_returns_the_sender_not_the_customer() -> None:
+    text = "INVOICE\nFROM: Acme Ltd\nBILL TO: Client Co\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") == "Acme Ltd"
+
+
+def test_explicit_from_label_wins_over_the_first_line() -> None:
+    text = "Header Text\nFROM: Studio Name\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") == "Studio Name"
+
+
+def test_first_valid_from_label_wins() -> None:
+    assert field("FROM: Acme Ltd\nFROM: Other Ltd", "vendor_name") == "Acme Ltd"
+    assert field("FROM: BILL TO:\nFROM: Acme Ltd", "vendor_name") == "Acme Ltd"
+
+
+def test_from_label_does_not_change_the_other_fields() -> None:
+    text = "FROM: Studio Name\nInvoice No: INV-1\nDate: 2026-10-17\nTotal: $1,100"
+
+    assert extract_invoice_fields(text) == {
+        "invoice_number": "INV-1",
+        "invoice_date": "2026-10-17",
+        "vendor_name": "Studio Name",
+        "subtotal": None,
+        "tax_amount": None,
+        "total_amount": "1100",
+    }
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "FROM:",  # Nothing after the label
+        "FROM:   ",
+        "FROM: BILL TO:",  # Two labels, no name
+        "FROM: Studio Name BILL TO: Client Name",  # Two parties with a second label
+        "FROM: Studio Name Bill To Client Name",  # Customer label without a colon
+        "FROM: Studio Name Ship To Client Name",
+        "FROM: Studio Name Sold To Client Name",
+        "FROM: billing@acme.com",
+        "FROM: www.acme.com",
+        "FROM: 12345",  # Starts with a digit
+        "FROM: ----",  # No letters
+        "FROM: " + "A" * 81,  # Too long
+        "FROM: Invoice No: INV-1",  # Another label inside
+    ],
+)
+def test_invalid_from_value_gives_no_vendor(line: str) -> None:
+    assert field(f"{line}\nInvoice No: INV-1", "vendor_name") is None
+
+
+def test_from_alone_on_its_line_is_not_returned_as_the_vendor() -> None:
+    assert field("FROM:\nStudio Name\nInvoice No: INV-1", "vendor_name") is None
+
+
+@pytest.mark.parametrize("line", ["FROM:", "FROM: BILL TO:", "From:"])
+def test_vendor_is_never_the_word_from(line: str) -> None:
+    assert field(f"{line}\nInvoice No: INV-1", "vendor_name") not in {"FROM", "From", "FROM:"}
+
+
+def test_invalid_from_label_falls_back_to_the_normal_vendor_rule() -> None:
+    text = "Acme Corp\nFROM: billing@acme.com\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") == "Acme Corp"
+
+
+@pytest.mark.parametrize(
+    "vendor", ["From Scratch Bakery", "Fromage Dairy Ltd", "From the Farm Foods"]
+)
+def test_vendor_names_that_merely_start_with_from_use_the_normal_rule(vendor: str) -> None:
+    assert field(f"{vendor}\nInvoice No: INV-1", "vendor_name") == vendor
+
+
 # --- Unrelated numbers -------------------------------------------------------
 
 
