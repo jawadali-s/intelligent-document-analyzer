@@ -664,6 +664,452 @@ def test_only_the_present_field_is_filled(text: str, present: dict[str, str]) ->
     assert extract_invoice_fields(text) == {**all_none(), **present}
 
 
+# --- Labels inside a line: real OCR text -------------------------------------
+
+# OCR output of a fictional test invoice, kept exactly as produced (noise included).
+LARKFIELD_OCR_TEXT = """Larkfield Stationers TAX INVOICE
+. A fictional company Invoice no. INV-2026-0142
+22 Example Market, Sampleton 000 000 Invoice date 18 September 2026
+Tonnes SPECIMEN aoe Due date 18 October 2026
+no.: * 7
+»  1eKn0 ; Order ref, PO-77310
+BILL TO ; :
+Example Traders (fictional) . .
+Unit 5, Specimen Industrial Estate
+Sampleton 000 000° . .
+Tax no.: SPECIMEN-TAX-0002 .
+# = ~~ Description - . Ay Unit price Amount
+1° A4 copier paper, 75 gsm, ream of 500 20 _ *285.00 %5,700.00
+2 Ballpoint pens, blue, box of 50 . 4 420.00 ™1,680.00
+3 Lever-arch files, A4, pack of 10 . 3 ‘899.00 %2,697.00
+4 Whiteboard markers, assorted, pack of 4 6 7160.00 %960.00
+5 Desk organiser, mesh, black 5 %349.00 71,745.00 .
+6 Sticky notes, 76 x 76 mm, pack of 12 — 8 7240.00 %1,920.00
+; Subtotal %14,702.00
+. , GST at 18% %2,646.36 .
+. Total due 17,348.36
+Payment
+Bank transfer to Specimen Bank, account SPECIMEN-0000-111 1, within .
+30 days. Please quote the invoice number with your payment.
+Every amount is quantity times unit price; the subtotal, GST and total add
+up to the paisa.
+: SPECIMEN - fictional document made by filedone.ai for testing. Free to use (CC0 1.0). Page 1 of 1"""
+
+LARKFIELD_EXPECTED = {
+    "invoice_number": "INV-2026-0142",
+    "invoice_date": "18 September 2026",
+    "vendor_name": "Larkfield Stationers",
+    "subtotal": "14702.00",
+    "tax_amount": "2646.36",
+    "total_amount": "17348.36",
+}
+
+
+def test_larkfield_ocr_text_extracts_all_six_fields() -> None:
+    assert extract_invoice_fields(LARKFIELD_OCR_TEXT) == LARKFIELD_EXPECTED
+
+
+def test_larkfield_result_keeps_the_six_keys_in_order() -> None:
+    assert list(extract_invoice_fields(LARKFIELD_OCR_TEXT)) == EXPECTED_FIELD_NAMES
+
+
+def test_larkfield_values_do_not_come_from_unrelated_lines() -> None:
+    result = extract_invoice_fields(LARKFIELD_OCR_TEXT)
+
+    assert result["invoice_date"] != "18 October 2026"  # Due date
+    assert result["tax_amount"] != "18"  # Tax rate
+    assert result["total_amount"] != result["subtotal"]
+    assert "BILL" not in (result["vendor_name"] or "").upper()
+    assert "Example Traders" not in (result["vendor_name"] or "")
+
+
+def test_larkfield_without_the_invoice_date_line_does_not_use_the_due_date() -> None:
+    text = LARKFIELD_OCR_TEXT.replace(
+        "22 Example Market, Sampleton 000 000 Invoice date 18 September 2026",
+        "22 Example Market, Sampleton 000 000",
+    )
+
+    assert extract_invoice_fields(text) == {**LARKFIELD_EXPECTED, "invoice_date": None}
+
+
+def test_larkfield_without_the_total_line_does_not_guess_a_total() -> None:
+    text = LARKFIELD_OCR_TEXT.replace(". Total due 17,348.36\n", "")
+
+    assert extract_invoice_fields(text) == {**LARKFIELD_EXPECTED, "total_amount": None}
+
+
+def test_larkfield_without_the_subtotal_line_does_not_guess_a_subtotal() -> None:
+    text = LARKFIELD_OCR_TEXT.replace("; Subtotal %14,702.00\n", "")
+
+    assert extract_invoice_fields(text) == {**LARKFIELD_EXPECTED, "subtotal": None}
+
+
+def test_larkfield_body_without_header_and_totals_returns_all_none() -> None:
+    lines = LARKFIELD_OCR_TEXT.split("\n")
+    body = "\n".join(lines[11:18] + lines[21:])  # Line items, payment note, footer
+
+    assert extract_invoice_fields(body) == all_none()
+
+
+# --- Labels inside a line: invoice number ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        (". A fictional company Invoice no. INV-2026-0142", "INV-2026-0142"),
+        ("22 Example Market, Lahore Invoice # A-17", "A-17"),
+        ("Phone 0300 1234567 Invoice Number: 00123", "00123"),
+        ("Sampleton 000 000 INVOICE NO INV-9", "INV-9"),
+        ("Page 1 Bill No. B-5", "B-5"),
+        ("Lahore Inv. No 77", "77"),
+        ("Invoice no. INV-2026-0142 .", "INV-2026-0142"),  # Stray punctuation after the value
+    ],
+)
+def test_invoice_number_label_inside_a_line(line: str, expected: str) -> None:
+    assert field(line, "invoice_number") == expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "30 days. Please quote the invoice number with your payment.",
+        "Please quote invoice no. 12 and 13",
+        "Phone 0300 1234567 Invoice No:",
+        "Phone 0300 1234567 Invoice No: ---",
+        "Lahore Invoice No. INV-1 Invoice date 18 September 2026",  # Two fields on one line
+        "Invoice noted: INV-5",
+        "Lahore Invoice Notes 12345",
+    ],
+)
+def test_unclear_invoice_number_inside_a_line_returns_none(line: str) -> None:
+    assert field(line, "invoice_number") is None
+
+
+def test_invoice_number_on_its_own_line_still_wins_over_the_relaxed_search() -> None:
+    text = "Acme Ltd Invoice no. X-1\nInvoice No: A-2"
+
+    assert field(text, "invoice_number") == "A-2"
+
+
+# --- Labels inside a line: invoice date and due date ------------------------
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("22 Example Market, Sampleton 000 000 Invoice date 18 September 2026", "18 September 2026"),
+        ("Page 1 Invoice Date: 2026-10-17", "2026-10-17"),
+        ("Lahore INVOICE DATE 17/10/2026", "17/10/2026"),
+        ("Lahore Bill Date 17 Oct 2026", "17 Oct 2026"),
+        (". Date: 18 September 2026", "18 September 2026"),  # Bare label after stray punctuation
+    ],
+)
+def test_invoice_date_label_inside_a_line(line: str, expected: str) -> None:
+    assert field(line, "invoice_date") == expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Tonnes SPECIMEN aoe Due date 18 October 2026",
+        "Net 30 Payment Due Date: 2026-11-17",
+        "Lahore Order date 5 Oct 2026",
+        "Issued Date 2026-10-17",  # A bare "Date" inside a line is too ambiguous
+        "Lahore Invoice date soon",
+        "Lahore Invoice date 31/04/2026",  # Not a real date
+    ],
+)
+def test_other_dates_and_unclear_dates_inside_a_line_return_none(line: str) -> None:
+    assert field(line, "invoice_date") is None
+
+
+def test_invoice_date_is_chosen_over_a_due_date_in_either_order() -> None:
+    due_first = "Sampleton Due date 18 October 2026\nSampleton Invoice date 18 September 2026"
+    due_last = "Sampleton Invoice date 18 September 2026\nSampleton Due date 18 October 2026"
+
+    assert field(due_first, "invoice_date") == "18 September 2026"
+    assert field(due_last, "invoice_date") == "18 September 2026"
+
+
+# --- Labels inside a line: subtotal, tax and total ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("line", "name", "expected"),
+    [
+        ("; Subtotal 14,702.00", "subtotal", "14702.00"),
+        (". Total due 17,348.36", "total_amount", "17348.36"),
+        (". , GST 2,646.36 .", "tax_amount", "2646.36"),
+        ("Qty 3 Subtotal 14,702.00", "subtotal", "14702.00"),
+        ("Qty 3 Grand Total Rs. 17,348.36", "total_amount", "17348.36"),
+        ("Qty 3 Amount Due 117.00", "total_amount", "117.00"),
+        ("Qty 3 Sales Tax 17.00", "tax_amount", "17.00"),
+        ("Qty 3 VAT 17.00", "tax_amount", "17.00"),
+        ("Qty 3 Total Amount 117.00", "total_amount", "117.00"),
+    ],
+)
+def test_money_label_inside_a_line_or_after_stray_punctuation(
+    line: str, name: str, expected: str
+) -> None:
+    assert field(line, name) == expected
+
+
+@pytest.mark.parametrize(
+    ("line", "name"),
+    [
+        ("Item total 100.00", "total_amount"),  # A bare "Total" inside a line is a line total
+        ("Sub total 100.00 Qty", "total_amount"),
+        ("Late Tax 17.00", "tax_amount"),  # A bare "Tax" inside a line is too ambiguous
+        ("Seller VAT 1234567", "tax_amount"),  # No decimals: could be a registration number
+        ("Seller GST 29", "tax_amount"),
+        ("Customer Tax no.: SPECIMEN-TAX-0002 .", "tax_amount"),
+        ("Qty 3 Subtotal 14,702", "subtotal"),  # Inside a line, amounts need two decimals
+        ("the subtotal, GST and total add", "subtotal"),
+        ("the subtotal, GST and total add", "tax_amount"),
+        ("the subtotal, GST and total add", "total_amount"),
+        ("Qty 3 Total due within 30 days", "total_amount"),
+    ],
+)
+def test_ambiguous_money_text_inside_a_line_returns_none(line: str, name: str) -> None:
+    assert field(line, name) is None
+
+
+def test_total_due_after_stray_punctuation_is_not_a_subtotal_or_tax() -> None:
+    result = extract_invoice_fields(". Total due 17,348.36")
+
+    assert result["total_amount"] == "17348.36"
+    assert result["subtotal"] is None
+    assert result["tax_amount"] is None
+
+
+# --- Tax lines with a rate: "GST at 18%" ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "GST at 18% 2,646.36",
+        "GST at 18.0% 2,646.36",
+        "GST AT 18% 2,646.36",
+        "GST @ 18% 2,646.36",
+        "GST @18% 2,646.36",
+        "GST at (18%) 2,646.36",
+        "GST at 18%: 2,646.36",
+        "GST at 18% Rs. 2,646.36",
+    ],
+)
+def test_tax_rate_with_the_word_at_is_not_read_as_the_amount(line: str) -> None:
+    assert field(line, "tax_amount") == "2646.36"
+
+
+@pytest.mark.parametrize("line", ["GST at 18%", "GST at 18% only", "GST at 18", "GST at %", "Tax at 5%"])
+def test_tax_rate_without_an_amount_returns_none(line: str) -> None:
+    assert field(line, "tax_amount") is None
+
+
+def test_tax_rate_line_followed_by_a_total_line_does_not_borrow_the_total() -> None:
+    result = extract_invoice_fields("GST at 18%\nTotal due 100.00")
+
+    assert result["tax_amount"] is None
+    assert result["total_amount"] == "100.00"
+
+
+# --- OCR currency errors: a leading "%" --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("line", "name", "expected"),
+    [
+        ("Subtotal %14,702.00", "subtotal", "14702.00"),
+        ("Subtotal: %14,702.00", "subtotal", "14702.00"),
+        ("Sales Tax: %2,646.36", "tax_amount", "2646.36"),
+        ("Grand Total %17,348.36", "total_amount", "17348.36"),
+        ("Total %0.50", "total_amount", "0.50"),
+        ("Total %1,23,456.00", "total_amount", "123456.00"),  # Indian digit grouping
+        ("Tax 18% %2,646.36", "tax_amount", "2646.36"),  # The rate is skipped, not the amount
+        ("Tax (18%) %2,646.36", "tax_amount", "2646.36"),
+    ],
+)
+def test_percent_sign_directly_before_a_printed_amount_is_treated_as_a_currency_symbol(
+    line: str, name: str, expected: str
+) -> None:
+    assert field(line, name) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "18%",  # A rate
+        "100.00%",  # A percent after the number
+        "100%",
+        "% 100.00",  # Detached from the number
+        "%100",  # No decimals: could be a rate
+        "%18",
+        "%100.5",
+        "%100.000",
+        "%%100.00",
+        "12%100.00",  # Percent in the middle of a number
+        "%1,2.00",  # Bad digit grouping
+        "%-100.00",
+        "%",
+        "100.00 %",
+    ],
+)
+@pytest.mark.parametrize(
+    ("label", "name"),
+    [("Subtotal", "subtotal"), ("Tax", "tax_amount"), ("Total", "total_amount")],
+)
+def test_percent_sign_in_other_positions_is_never_turned_into_an_amount(
+    label: str, name: str, raw: str
+) -> None:
+    assert field(f"{label}: {raw}", name) is None
+
+
+@pytest.mark.parametrize("raw", ["*100.00", "™100.00", "‘100.00", "?100.00", "¥100.00"])
+def test_other_possible_currency_misreads_are_not_guessed(raw: str) -> None:
+    assert field(f"Total: {raw}", "total_amount") is None
+
+
+def test_percent_sign_is_not_treated_as_a_currency_symbol_for_other_fields() -> None:
+    assert field("Invoice No: %123", "invoice_number") is None
+    assert field("Invoice Date: %2026-10-17", "invoice_date") is None
+
+
+# --- Stray punctuation around values and labels ------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Total: 100.00 .",
+        "Total: 100.00 ,",
+        "Total: 100.00 ; .",
+        "Total: 100.00 '",
+        "Total: 100.00 |",
+        "Total: 100.00 *",
+        "; Total: 100.00",
+        ". , Total 100.00 .",
+    ],
+)
+def test_stray_punctuation_tokens_around_a_labelled_amount_are_ignored(line: str) -> None:
+    assert field(line, "total_amount") == "100.00"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Total: 100.00.",  # Punctuation attached to the number is still malformed
+        "Total: 100.00,",
+        "Total: 100.00 abc",
+        "Total: 100.00 200.00",
+        "Total: 100.00 .5",
+    ],
+)
+def test_attached_or_meaningful_trailing_text_is_still_rejected(line: str) -> None:
+    assert field(line, "total_amount") is None
+
+
+def test_a_trailing_currency_symbol_is_still_a_valid_existing_format() -> None:
+    assert field("Total: 100.00 $", "total_amount") == "100.00"
+
+
+# --- Vendor name with a title on the same line -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("first_line", "expected"),
+    [
+        ("Larkfield Stationers TAX INVOICE", "Larkfield Stationers"),
+        ("Larkfield Stationers  TAX   INVOICE", "Larkfield Stationers"),
+        ("Larkfield Stationers INVOICE", "Larkfield Stationers"),
+        ("Larkfield Stationers SALES INVOICE", "Larkfield Stationers"),
+        ("Ahmed & Sons (Pvt.) Ltd. COMMERCIAL INVOICE", "Ahmed & Sons (Pvt.) Ltd."),
+        ("Café Müller GmbH PROFORMA INVOICE", "Café Müller GmbH"),
+        ("Larkfield Stationers RECEIPT", "Larkfield Stationers"),
+        ("ACME TRADERS TAX INVOICE", "ACME TRADERS"),  # Whole line in capitals, two-word title
+    ],
+)
+def test_generic_title_at_the_end_of_the_vendor_line_is_removed(
+    first_line: str, expected: str
+) -> None:
+    assert field(f"{first_line}\nInvoice No: INV-1", "vendor_name") == expected
+
+
+@pytest.mark.parametrize(
+    "first_line",
+    [
+        "Fast Invoice",  # Title case: could be a company name
+        "Pro Bill",
+        "Receipt Rolls Ltd",  # Title word is not at the end
+        "Invoice Solutions Ltd",
+        "ACME INVOICE",  # One-word title with nothing to tell it from a name
+        "Quick Estimate Co",
+    ],
+)
+def test_title_like_words_inside_a_vendor_name_are_kept(first_line: str) -> None:
+    assert field(f"{first_line}\nInvoice No: INV-1", "vendor_name") == first_line
+
+
+def test_title_removal_only_applies_when_a_name_remains() -> None:
+    assert field("TAX INVOICE\nInvoice No: INV-1", "vendor_name") is None
+    assert field("INVOICE\nAcme Corp\nInvoice No: INV-1", "vendor_name") == "Acme Corp"
+
+
+def test_vendor_with_a_title_suffix_is_not_reported_without_confirming_fields() -> None:
+    assert field("Larkfield Stationers TAX INVOICE\nThank you", "vendor_name") is None
+
+
+def test_vendor_is_confirmed_by_a_label_inside_a_later_line() -> None:
+    text = "Larkfield Stationers TAX INVOICE\n22 Example Market Invoice no. INV-9"
+
+    assert field(text, "vendor_name") == "Larkfield Stationers"
+
+
+def test_vendor_is_not_confirmed_by_a_sentence_that_mentions_a_label() -> None:
+    text = "Larkfield Stationers\nPlease quote the invoice number with your payment."
+
+    assert field(text, "vendor_name") is None
+
+
+# --- Vendor name: never the customer or a field line -------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "BILL TO\nExample Traders (fictional)\nInvoice No: INV-1",
+        "INVOICE\nBILL TO Example Traders\nInvoice No: INV-1",
+        "Bill To Example Traders\nInvoice No: INV-1",
+        "Larkfield Stationers TAX INVOICE BILL TO Example Traders\nInvoice No: INV-1",
+        "Larkfield Stationers Ship To Example Traders\nInvoice No: INV-1",
+    ],
+)
+def test_customer_named_after_bill_to_is_never_the_vendor(text: str) -> None:
+    assert field(text, "vendor_name") is None
+
+
+@pytest.mark.parametrize("vendor", ["Billing Services Ltd", "Bill Tomlinson & Co", "Soldo Traders"])
+def test_vendor_names_that_only_resemble_a_customer_label_are_kept(vendor: str) -> None:
+    assert field(f"{vendor}\nInvoice No: INV-1", "vendor_name") == vendor
+
+
+def test_first_line_holding_an_invoice_number_is_not_returned_as_the_vendor() -> None:
+    text = ". A fictional company Invoice no. INV-2026-0142\nInvoice Date: 2026-10-17"
+
+    assert extract_invoice_fields(text) == {
+        **all_none(),
+        "invoice_number": "INV-2026-0142",
+        "invoice_date": "2026-10-17",
+    }
+
+
+def test_first_line_holding_an_invoice_date_is_not_returned_as_the_vendor() -> None:
+    text = "Sampleton Invoice date 18 September 2026\nInvoice No: INV-1"
+
+    assert field(text, "vendor_name") is None
+
+
 # --- Empty and whitespace-only text -----------------------------------------
 
 
