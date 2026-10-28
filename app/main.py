@@ -13,6 +13,14 @@ from app.schemas import UploadResponse
 
 logger = logging.getLogger(__name__)
 
+# Page segmentation mode for the second OCR pass, used only when the first pass
+# leaves an invoice field empty. PSM 4 reads text in columns of variable size,
+# which recovers table cells that PSM 6 can drop.
+FALLBACK_PSM = 4
+# Third pass, only for fields still empty: a 0.75x copy of the page. Tesseract can
+# misread the commas of an amount at one scale and read them correctly at another.
+RESCUE_SCALE = 0.75
+
 MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 READ_CHUNK_SIZE_BYTES = 1024 * 1024  # 1 MB
 MAX_IMAGE_PIXELS = 40_000_000  # Images larger than this are rejected
@@ -187,7 +195,12 @@ async def upload_invoice_image(
         # The pipeline takes the file's raw bytes, not the BytesIO or a Pillow image.
         image_bytes = image_buffer.getvalue()
         try:
-            result = await run_in_threadpool(process_invoice_image, image_bytes)
+            result = await run_in_threadpool(
+                process_invoice_image,
+                image_bytes,
+                fallback_psm=FALLBACK_PSM,
+                rescue_scale=RESCUE_SCALE,
+            )
         except ImageDecodeError as exc:
             raise HTTPException(status_code=422, detail=DECODE_FAILURE_MESSAGE) from exc
         except OCRError as exc:
