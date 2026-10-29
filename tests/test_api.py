@@ -60,12 +60,22 @@ class PipelineSpy:
 
     def __init__(self) -> None:
         self.calls: list[bytes] = []
+        self.fallback_psms: list[int | None] = []
+        self.rescue_scales: list[float | None] = []
         self.result = copy.deepcopy(FAKE_PIPELINE_RESULT)
         self.error: Exception | None = None
         self.ran_inside_event_loop: bool | None = None
 
-    def __call__(self, image_bytes: bytes) -> dict:
+    def __call__(
+        self,
+        image_bytes: bytes,
+        *,
+        fallback_psm: int | None = None,
+        rescue_scale: float | None = None,
+    ) -> dict:
         self.calls.append(image_bytes)
+        self.fallback_psms.append(fallback_psm)
+        self.rescue_scales.append(rescue_scale)
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -188,6 +198,35 @@ def test_upload_passes_the_uploaded_bytes_to_the_pipeline(
     assert response.status_code == 200
     assert pipeline_spy.calls == [png_bytes]
     assert type(pipeline_spy.calls[0]) is bytes  # Not a BytesIO or Pillow image
+
+
+def test_upload_enables_the_psm_4_fallback(
+    client: TestClient, pipeline_spy: PipelineSpy
+) -> None:
+    response = upload(client, make_image_bytes("PNG", size=(90, 60)))
+
+    assert response.status_code == 200
+    assert pipeline_spy.fallback_psms == [4]
+    assert main_module.FALLBACK_PSM == 4
+
+
+def test_upload_enables_the_rescaled_third_pass(
+    client: TestClient, pipeline_spy: PipelineSpy
+) -> None:
+    response = upload(client, make_image_bytes("PNG", size=(90, 60)))
+
+    assert response.status_code == 200
+    assert pipeline_spy.rescue_scales == [0.75]
+    assert main_module.RESCUE_SCALE == 0.75
+
+
+def test_upload_response_structure_is_unchanged_by_the_fallback(
+    client: TestClient, pipeline_spy: PipelineSpy
+) -> None:
+    body = upload(client, make_image_bytes("PNG", size=(90, 60))).json()
+
+    assert set(body) == EXPECTED_UPLOAD_KEYS
+    assert set(body["invoice_fields"]) == EXPECTED_FIELD_NAMES
 
 
 def test_pipeline_runs_in_a_worker_thread_not_in_the_event_loop(
