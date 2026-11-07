@@ -144,6 +144,6 @@ This script helps examine OCR behavior and is not a formal accuracy benchmark.
 
 ## Technical Documentation
 
-For detailed information about the system architecture, implementation, processing pipeline, API, testing, and application demonstrations, see:
-
+For detailed information about the system architecture, implementation, processing pipeline, API, testing, and application demonstrations, 
+see:
 [**View Final Project Technical Documentation (PDF)**](docs/Intelligent_Image_Document_Analyzer_Documentation.pdf)
